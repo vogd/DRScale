@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>DR Scale Analysis</title>
+<style>
+body { font-family: -apple-system, Arial, sans-serif; max-width: 960px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #333; }
+h1 { border-bottom: 2px solid #232f3e; padding-bottom: 10px; color: #232f3e; }
+h2 { color: #232f3e; margin-top: 40px; border-bottom: 1px solid #ddd; padding-bottom: 5px; }
+h3 { color: #545b64; }
+table { border-collapse: collapse; width: 100%; margin: 20px 0; }
+th { background: #232f3e; color: white; padding: 10px 12px; text-align: left; }
+td { padding: 8px 12px; border-bottom: 1px solid #ddd; }
+tr:hover { background: #f5f5f5; }
+code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+pre { background: #1a1a2e; color: #e0e0e0; padding: 16px; border-radius: 6px; overflow-x: auto; }
+pre code { background: none; color: inherit; }
+strong { color: #232f3e; }
+hr { border: none; border-top: 2px solid #ff9900; margin: 30px 0; }
+</style>
+</head><body>
+<h1>DR Infrastructure Scale-Up Analysis — EC2 Instance Provisioning at Scale</h1>
+<p><strong>Region:</strong> us-west-2 (Oregon)
+<strong>Date:</strong> April 23, 2026
+<strong>Target:</strong> 2,100 EC2 instances across 3 Availability Zones</p>
+<hr />
+<h2>Executive Summary</h2>
+<p>We conducted live provisioning tests in us-west-2 to measure EC2 instance creation time, API throughput, and health check latency at scale. We provisioned over 1,400 instances across multiple test runs with zero API throttling, zero health check failures, and zero capacity errors.</p>
+<p><strong>Key finding:</strong> With default AWS limits and a rolling pool approach (batches of 50–100), no API rate limit increases are required. Provisioning 2,100 instances takes approximately 2–3 hours. For sub-5-minute DR failover where all 2,100 instances launch simultaneously, specific limit increases are needed (detailed below).</p>
+<p>Application distribution to these instances will be handled separately by your team after instance provisioning is complete.</p>
+<hr />
+<h2>How Instance Provisioning Works</h2>
+<p>Each batch follows this lifecycle:</p>
+<pre><code>1. RunInstances API call (single call creates N instances)
+   ├─ EC2 instances created
+   ├─ 4 EBS gp3 volumes per instance (via BlockDeviceMappings, no separate API calls)
+   └─ Tags applied (via TagSpecifications, no separate API calls)
+   Time: 3–5 seconds
+
+2. Wait for &quot;running&quot; state
+   ├─ EC2 places instance on host hardware
+   ├─ ENI attached, network configured
+   ├─ EBS volumes: creating → attaching → in-use
+   └─ OS boots
+   Time: 17–19 seconds
+
+3. Wait for health checks (2/2 passed)
+   ├─ System reachability check (hypervisor → instance network path)
+   └─ Instance reachability check (OS-level response)
+   Time: 90–300 seconds
+
+4. Instance is healthy → ready for application deployment
+</code></pre>
+<h3>APIs Called During Provisioning</h3>
+<table>
+<thead>
+<tr>
+<th>API</th>
+<th>Purpose</th>
+<th>When Called</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>RunInstances</code></td>
+<td>Creates instances + EBS volumes + tags in one call</td>
+<td>Once per batch</td>
+</tr>
+<tr>
+<td><code>DescribeInstances</code></td>
+<td>Waits for instances to reach "running" state</td>
+<td>Once per batch (waiter)</td>
+</tr>
+<tr>
+<td><code>DescribeInstanceStatus</code></td>
+<td>Polls health checks until 2/2 passed</td>
+<td>Every 15s until all healthy</td>
+</tr>
+<tr>
+<td><code>TerminateInstances</code></td>
+<td>Removes instance after test or on health failure</td>
+<td>Once per instance</td>
+</tr>
+</tbody>
+</table>
+<p><code>CreateVolume</code>, <code>AttachVolume</code>, and <code>CreateTags</code> are handled implicitly inside <code>RunInstances</code> when using <code>BlockDeviceMappings</code> and <code>TagSpecifications</code>. No separate API calls are made for EBS or tagging.</p>
+<hr />
+<h2>Error Handling</h2>
+<h3>API Throttling — Exponential Backoff</h3>
+<p>If AWS returns <code>RequestLimitExceeded</code> or <code>ThrottlingException</code>, the system automatically retries:
+- Backoff delay: 1s → 2s → 4s → 8s → 16s → 32s → 60s (capped)
+- Random jitter added to prevent thundering herd across parallel processes
+- Maximum 5 retries per call before reporting failure
+- <strong>Result: Zero throttling events across all tests (1,400+ instances)</strong></p>
+<h3>Instance Capacity — Family Fallback Chain</h3>
+<p>If <code>InsufficientInstanceCapacity</code> is returned, the system automatically tries the next closest instance family:</p>
+<pre><code>m5 → m5a → m5n → m4 → c5 → c5a → c5n → c4 → r5 → r5a → r5n → r4
+</code></pre>
+<p>This ensures provisioning continues even if the primary instance type is unavailable in a specific AZ. Each fallback is logged and reported.</p>
+<h3>Health Check Failures</h3>
+<p>Each instance is individually monitored for 2/2 health checks (system + instance reachability):
+- If an instance fails: immediately terminated, logged, NOT counted as provisioned
+- A replacement instance is launched automatically
+- Loop protection: if consecutive failures exceed a threshold, provisioning for that AZ is aborted to prevent infinite retry loops
+- On <code>--resume</code>: only the deficit is re-provisioned (completed instances are tracked in state file)</p>
+<p><strong>Result: Zero health check failures across all tests.</strong></p>
+<hr />
+<h2>Test Results — Batch Size Comparison</h2>
+<p>All tests: m5.xlarge, 4 gp3 EBS volumes (20GB root + 3×50GB data), 3 AZs in us-west-2, health checks waited on for every instance.</p>
+<h3>Measured: 600 Instances (200 per AZ)</h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Batch 10</th>
+<th>Batch 25*</th>
+<th>Batch 50</th>
+<th>Batch 100</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Total time</strong></td>
+<td>~100m</td>
+<td>~75m</td>
+<td>49.7m</td>
+<td>38.0m</td>
+</tr>
+<tr>
+<td><strong>Per AZ</strong></td>
+<td>~33m</td>
+<td>~25m</td>
+<td>~16m</td>
+<td>~13m</td>
+</tr>
+<tr>
+<td><strong>RunInstances calls</strong></td>
+<td>63</td>
+<td>27</td>
+<td>29</td>
+<td>10</td>
+</tr>
+<tr>
+<td><strong>TerminateInstances calls</strong></td>
+<td>210</td>
+<td>600</td>
+<td>600</td>
+<td>600</td>
+</tr>
+<tr>
+<td><strong>DescribeInstanceStatus calls</strong></td>
+<td>63</td>
+<td>~45</td>
+<td>51</td>
+<td>30</td>
+</tr>
+<tr>
+<td><strong>Total API calls</strong></td>
+<td>~400</td>
+<td>~700</td>
+<td>709</td>
+<td>650</td>
+</tr>
+<tr>
+<td><strong>Peak RPS (any API)</strong></td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+</tr>
+<tr>
+<td><strong>Throttling events</strong></td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+</tr>
+<tr>
+<td><strong>Health check failures</strong></td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+</tr>
+</tbody>
+</table>
+<p>*Batch 25 estimated from interpolation of measured data points.</p>
+<h3>Projected: 2,100 Instances (700 per AZ)</h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Batch 10</th>
+<th>Batch 25</th>
+<th>Batch 50</th>
+<th>Batch 100</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Total time</strong></td>
+<td>~5.8 hours</td>
+<td>~4.4 hours</td>
+<td>~2.9 hours</td>
+<td>~2.2 hours</td>
+</tr>
+<tr>
+<td><strong>RunInstances calls</strong></td>
+<td>210</td>
+<td>84</td>
+<td>101</td>
+<td>35</td>
+</tr>
+<tr>
+<td><strong>Total API calls</strong></td>
+<td>~1,400</td>
+<td>~2,450</td>
+<td>~2,481</td>
+<td>~2,275</td>
+</tr>
+<tr>
+<td><strong>Peak RPS</strong></td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+</tr>
+<tr>
+<td><strong>Limit increases needed</strong></td>
+<td>None</td>
+<td>None</td>
+<td>None</td>
+<td>None</td>
+</tr>
+</tbody>
+</table>
+<h3>Key Observations</h3>
+<ol>
+<li><strong>Larger batches = faster provisioning</strong> — Batch 100 is 62% faster than batch 10</li>
+<li><strong>Peak RPS stays at 1 regardless of batch size</strong> — Rolling pool means we never burst multiple API calls per second</li>
+<li><strong>No API limit increases needed</strong> with the rolling pool approach at any batch size</li>
+<li><strong>Health check wait is the bottleneck</strong> — Instance launch takes 17-19s, but health checks take 90-300s</li>
+<li><strong>Zero throttling across all tests</strong> — 1,400+ instances provisioned without a single <code>RequestLimitExceeded</code></li>
+</ol>
+<hr />
+<h2>Why We Don't Hit API Limits with Rolling Batches</h2>
+<p>AWS EC2 uses a token bucket algorithm for API rate limiting. Each API has a bucket with maximum capacity (burst) and a refill rate (sustained throughput).</p>
+<p>With our rolling pool approach, we make one <code>RunInstances</code> call every few minutes as instances complete health checks and get replaced. Peak RPS never exceeds 1.</p>
+<table>
+<thead>
+<tr>
+<th>API</th>
+<th>Bucket Max</th>
+<th>Refill/s</th>
+<th>Our Peak RPS</th>
+<th>Bucket Utilization</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RunInstances</td>
+<td>5</td>
+<td>2/s</td>
+<td>1</td>
+<td>20%</td>
+</tr>
+<tr>
+<td>TerminateInstances</td>
+<td>100</td>
+<td>5/s</td>
+<td>1</td>
+<td>1%</td>
+</tr>
+<tr>
+<td>DescribeInstances</td>
+<td>100</td>
+<td>20/s</td>
+<td>1</td>
+<td>1%</td>
+</tr>
+<tr>
+<td>DescribeInstanceStatus</td>
+<td>100</td>
+<td>20/s</td>
+<td>1</td>
+<td>1%</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Even at 2,100 instances, the peak RPS remains 1.</strong> Only the total number of calls increases — the rate stays the same. The bucket refills faster than we consume tokens, so we never hit the limit.</p>
+<hr />
+<h2>Sub-5-Minute DR Failover — What It Means and What It Requires</h2>
+<h3>What is Sub-5-Minute Failover?</h3>
+<p>Instead of provisioning instances in rolling batches over 2–3 hours, all 2,100 instances are launched simultaneously in a single burst. The timeline:</p>
+<pre><code>T+0s:    5 × RunInstances(500) — all 2,100 instances requested
+T+3s:    All API calls complete (fits in burst bucket)
+T+20s:   All 2,100 instances reach &quot;running&quot; state
+T+120s:  First instances pass health checks
+T+180s:  All 2,100 instances healthy
+T+180s+: Application deployment begins (customer-managed)
+</code></pre>
+<p><strong>Total: ~3 minutes from trigger to 2,100 healthy instances.</strong></p>
+<h3>Why This Requires Limit Increases</h3>
+<p>When launching 2,100 instances simultaneously, we hit two bottlenecks that don't exist with rolling batches:</p>
+<p><strong>1. RunInstances Resource Bucket (the critical bottleneck)</strong></p>
+<p>The resource bucket controls how many instances can be created per second. Default: 1,000 burst capacity, refills at 2 instances/second.</p>
+<pre><code>Batch 1: RunInstances(500) → 500 resource tokens consumed (500 remaining)
+Batch 2: RunInstances(500) → 500 tokens consumed (0 remaining)
+── bucket empty, must wait ──
+Wait 250 seconds for 500 tokens to refill at 2/sec
+Batch 3: RunInstances(500) → 500 tokens consumed
+Wait 300 seconds for 600 more tokens
+Batch 4+5: remaining 600 instances
+
+Total wait: ~550 seconds (9.2 minutes) just for API rate limiting
+</code></pre>
+<p>With bucket increased to 3,000: all 2,100 instances launch in one burst, zero wait.</p>
+<p><strong>2. On-Demand vCPU Quota</strong></p>
+<p>Default quota is ~1,920 vCPUs. Each m5.xlarge uses 4 vCPUs. 2,100 instances × 4 = 8,400 vCPUs needed simultaneously. With rolling batches of 100, only 400 vCPUs are concurrent — well within the default.</p>
+<p><strong>3. gp3 Storage Quota</strong></p>
+<p>Default is 50 TiB. Each instance uses 170GB (4 volumes). 2,100 × 170GB = 348 TiB needed simultaneously. With rolling batches, terminated instances release storage immediately.</p>
+<h3>Required Limit Increases for Sub-5-Minute Failover</h3>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>Current Default</th>
+<th>Required</th>
+<th>Why</th>
+<th>How to Request</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RunInstances resource bucket</td>
+<td>1,000 burst / 2 per sec</td>
+<td><strong>3,000 burst / 10 per sec</strong></td>
+<td>Launch all 2,100 in one burst without waiting for refill</td>
+<td>AWS Support case</td>
+</tr>
+<tr>
+<td>RunInstances request bucket</td>
+<td>5 burst / 2 per sec</td>
+<td><strong>10 burst / 5 per sec</strong></td>
+<td>Allow 5 concurrent RunInstances(500) calls</td>
+<td>AWS Support case</td>
+</tr>
+<tr>
+<td>On-Demand vCPUs (Standard)</td>
+<td>~1,920</td>
+<td><strong>10,000+</strong></td>
+<td>2,100 × 4 vCPU = 8,400 concurrent</td>
+<td>Service Quotas console</td>
+</tr>
+<tr>
+<td>gp3 storage</td>
+<td>50 TiB</td>
+<td><strong>400 TiB</strong></td>
+<td>2,100 × 170GB = 348 TiB concurrent</td>
+<td>Service Quotas console</td>
+</tr>
+<tr>
+<td>ENIs per region</td>
+<td>5,000</td>
+<td>5,000 (no change)</td>
+<td>2,100 &lt; 5,000</td>
+<td>None needed</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Note:</strong> API rate limits (RunInstances buckets) are NOT adjustable via the Service Quotas console. They require an AWS Support case with the following template:</p>
+<pre><code>Subject: Request an increase in my Amazon EC2 API throttling limits
+Region: us-west-2
+
+us-west-2 resource rate increases:
+    RunInstances: 3000 (bucket max) | 10 (refill rate)
+
+us-west-2 request rate increases:
+    RunInstances: 10 (bucket max) | 5 (refill rate)
+</code></pre>
+<h3>Optional: On-Demand Capacity Reservations (ODCR)</h3>
+<p>Even with all limits raised, there is a risk that AWS may not have 2,100 m5.xlarge instances physically available in your AZs during a real DR event (e.g., regional outage causing high demand). ODCR guarantees that capacity is reserved for you 24/7.</p>
+<ul>
+<li>ODCR costs the On-Demand rate whether instances are running or not</li>
+<li>Can be paired with Reserved Instances or Savings Plans for ~37% discount</li>
+<li>Without ODCR: risk of <code>InsufficientInstanceCapacity</code> during high-demand events (mitigated by our automatic family fallback chain)</li>
+</ul>
+<hr />
+<h2>Recommendation Summary</h2>
+<table>
+<thead>
+<tr>
+<th>Approach</th>
+<th>Time for 2,100</th>
+<th>Limit Changes Needed</th>
+<th>Best For</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Rolling batch 50</td>
+<td>~3 hours</td>
+<td>None</td>
+<td>Testing, non-critical DR</td>
+</tr>
+<tr>
+<td>Rolling batch 100</td>
+<td>~2.2 hours</td>
+<td>None</td>
+<td>Moderate RTO requirements</td>
+</tr>
+<tr>
+<td>Parallel batch 500</td>
+<td>~3 minutes</td>
+<td>API buckets + vCPU + gp3 quotas</td>
+<td>Fast DR, accept capacity risk</td>
+</tr>
+<tr>
+<td>Parallel + ODCR</td>
+<td>~3 minutes</td>
+<td>API buckets + vCPU + gp3 + ODCR</td>
+<td>Mission-critical DR with guaranteed capacity</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<p>Please let us know if you'd like to proceed with limit increase requests or schedule a full-scale 2,100 instance test.</p></body></html>
